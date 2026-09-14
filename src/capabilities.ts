@@ -26,9 +26,23 @@ function stateRoot(agent: Agent, config: CapabilityConfig): string {
   return join(agent.session.header.cwd ?? process.cwd(), config.stateDir)
 }
 
+/**
+ * Captain-only AgentTeams tool names that this composition actually registers.
+ *
+ * `tools.restrict()` fails on a name no scope registers, so a partial
+ * registration would otherwise throw while a member session starts. Names that
+ * cannot be called need no retirement.
+ */
+function memberDenyList(agent: Agent): string[] {
+  const requested = TEAM_TOOL_NAMES.filter(name => !MEMBER_TOOL_NAMES.includes(name))
+  let schemas
+  try { schemas = agent.ctx.tools.schemas() } catch { return requested }
+  const present = new Set(schemas.map(schema => schema.name))
+  return requested.filter(name => present.has(name))
+}
+
 /** Synchronous startup/HMR hydration must finish before the first assembly. */
-function currentTeam(agent: Agent, config: CapabilityConfig): TeamState | undefined {
-  const root = stateRoot(agent, config)
+function currentTeam(agent: Agent, config: CapabilityConfig): TeamState | undefined {  const root = stateRoot(agent, config)
   let entries
   try { entries = readdirSync(root, { withFileTypes: true }) } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
@@ -87,9 +101,7 @@ export function installTeamCapabilities(ctx: Context, config: CapabilityConfig):
     states.set(agent, state)
     active.add(state)
     try {
-      if (member) revoke = agent.ctx.tools.restrict({
-        deny: TEAM_TOOL_NAMES.filter(name => !MEMBER_TOOL_NAMES.includes(name)),
-      })
+      if (member) revoke = agent.ctx.tools.restrict({ deny: memberDenyList(agent) })
       releaseLifetime = agent.ctx.effect(() => state.dispose, 'agent-teams: capability lifetime')
       return state
     } catch (error) { state.dispose(); throw error }

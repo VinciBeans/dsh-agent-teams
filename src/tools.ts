@@ -17,6 +17,7 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { join } from 'node:path'
+import { appendFileSync } from 'node:fs'
 import { appendTeamEvent, captainSessionOf } from './events.ts'
 import {
   acknowledgeMailbox,
@@ -431,16 +432,48 @@ export function registerAgentTeamsTools(ctx: Context, config: ToolsConfig): Agen
     scheduler.kickMember(workspace, teamId, memberName)
   ))
 
+  // A silent `false` from this function rolls the task back to pending with no
+  // user-visible reason, so the team's state dir keeps what the scheduler cannot
+  // otherwise show. Best effort: diagnostics never change dispatch behaviour.
+  const noteDispatchFailure = (root: string, teamId: string, memberName: string, reason: string, detail: Record<string, unknown> = {}): void => {
+    try {
+      appendFileSync(
+        join(root, teamId, 'dispatch-failure.jsonl'),
+        `${JSON.stringify({ at: new Date().toISOString(), memberName, reason, ...detail })}\n`,
+      )
+    } catch {
+      // Diagnostics must never change dispatch behaviour.
+    }
+  }
+
   async function dispatchMember(captain: Agent, teamId: string, memberName: string, text: string, signal: AbortSignal, mode: 'queue' | 'steer', attemptId?: string): Promise<boolean> {
     const root = stateRootOf(workspaceOf(captain), config)
     let orphan: TeamMember | undefined
     try {
       return await withTeamLock(teamLockKey(root, teamId), async () => {
         const team = await readTeam(root, teamId)
-        if (team?.captainSessionId !== captain.id || team.halted === true || team.phase === 'staged') return false
+        if (team?.captainSessionId !== captain.id || team.halted === true || team.phase === 'staged') {
+          noteDispatchFailure(root, teamId, memberName, 'team-state-guard', {
+            found: team !== undefined, halted: team?.halted, phase: team?.phase,
+            captainMatches: team?.captainSessionId === captain.id, attemptId,
+          })
+          return false
+        }
         const member = team.members.find(item => item.name === memberName && item.status !== 'removed')
-        if (member === undefined || member.stopping === true || team.tasks.some(task => task.reassigning === true && task.assignee === memberName)) return false
-        if (attemptId !== undefined && !team.tasks.some(task => task.attemptId === attemptId && task.assignee === memberName && (task.status === 'claimed' || task.status === 'in_progress'))) return false
+        if (member === undefined || member.stopping === true || team.tasks.some(task => task.reassigning === true && task.assignee === memberName)) {
+          noteDispatchFailure(root, teamId, memberName, 'member-guard', {
+            found: member !== undefined, memberStatus: member?.status, stopping: member?.stopping,
+            reassigningTasks: team.tasks.filter(task => task.reassigning === true).map(task => task.id), attemptId,
+          })
+          return false
+        }
+        if (attemptId !== undefined && !team.tasks.some(task => task.attemptId === attemptId && task.assignee === memberName && (task.status === 'claimed' || task.status === 'in_progress'))) {
+          noteDispatchFailure(root, teamId, memberName, 'attempt-capability-guard', {
+            attemptId,
+            tasks: team.tasks.map(task => ({ id: task.id, status: task.status, assignee: task.assignee, attemptId: task.attemptId })),
+          })
+          return false
+        }
         if (member.id !== '') return deliverToMember(ctx, captain, member.id, text, signal, mode)
         const selection = await resolveMemberLlmSelection(ctx, captain, {
           provider: member.provider, model: member.model, reasoningEffort: member.reasoningEffort, fallback: member.fallback,
@@ -456,6 +489,11 @@ export function registerAgentTeamsTools(ctx: Context, config: ToolsConfig): Agen
         await recordRetiredMemberIds(root, [orphan.id])
         await stopTeamMemberActivations(ctx, captain, [orphan])
       }
+      noteDispatchFailure(root, teamId, memberName, 'spawn-threw', {
+        error: String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        orphanId: orphan?.id,
+      })
       ctx.logger.warn(`agent-teams: member dispatch failed for ${memberName}: ${String(error)}`)
       return false
     }

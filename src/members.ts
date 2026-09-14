@@ -33,6 +33,27 @@ export const PERSONA_PROTOCOL_MAX_CHARS = 400
 const MEMBER_DENIED_TOOLS = CAPTAIN_TOOL_NAMES
 
 /**
+ * Names to deny on a member's delegation surface.
+ *
+ * `tools.restrict()` rejects any name the composition does not register, and a
+ * surface bundle may leave a delegation tool unmounted on purpose: `dsh-web-app`
+ * disables the base `tool-subagent` rows and lets each preset mount the
+ * delegation tools its agent sees, so `subagent` is legitimately absent there.
+ * Denying a name that cannot exist is meaningless, while naming it fails the
+ * whole member composition — so filter to the global tools this captain can
+ * actually call and keep the retirement of those from members.
+ */
+function memberToolDenyList(ctx: Context, maxDepth: number | undefined): string[] {
+  const requested = [...MEMBER_DENIED_TOOLS, ...(maxDepth === 0 ? ['subagent', 'send_message'] : [])]
+  // A context without the tools service cannot be filtered; keep the requested
+  // list rather than silently dropping the captain's retirement from members.
+  let schemas
+  try { schemas = ctx.tools.schemas() } catch { return requested }
+  const present = new Set(schemas.map(schema => schema.name))
+  return requested.filter(name => present.has(name))
+}
+
+/**
  * Restore the SessionId brand on a value that round-tripped through the
  * durable team file. The brand is erased by JSON serialization; the value
  * originated from `startContinuable`/`agent.id`, so this cast is the boundary
@@ -635,7 +656,7 @@ export async function spawnMember(
         prompt: [{ type: 'text', text: initialPrompt ?? memberWelcome(team, member.name) }],
         parent: captain,
         persona: memberPersona(team, member, stateDir, config.executionPrompt),
-        toolFilter: { deny: [...MEMBER_DENIED_TOOLS, ...(config.maxDepth === 0 ? ['subagent', 'send_message'] : [])] },
+        toolFilter: { deny: memberToolDenyList(ctx, config.maxDepth) },
         agentOptions: {
           provider: llmSelection.provider,
           model: llmSelection.model,

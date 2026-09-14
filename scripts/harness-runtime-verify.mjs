@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 /** Real published Harness product-entry verification. Only the model is a fixture.
  * Usage: node scripts/harness-runtime-verify.mjs --host-version <exact>
- *   --artifact <package.tgz> --report-dir <isolated-directory>
- * Optional: --runtime-dir <already prepared directory> --prepare-only
+ *   (--artifact <package.tgz> | --plugin-dir <checkout>) --report-dir <isolated-directory>
+ * Optional: --runtime-dir <prepared directory> --prepare-only --skip-install
  */
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, copyFileSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, copyFileSync, symlinkSync, openSync, closeSync, rmSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
-const allowedFlags = new Set(['--host-version', '--artifact', '--report-dir', '--runtime-dir', '--scenario', '--prepare-only']);
+const allowedFlags = new Set(['--host-version', '--artifact', '--plugin-dir', '--report-dir', '--runtime-dir', '--scenario', '--prepare-only', '--skip-install']);
 const flags = new Map();
 for (let i = 2; i < process.argv.length; i++) {
     const arg = process.argv[i];
     if (!allowedFlags.has(arg) || flags.has(arg)) throw Error('Unknown or duplicate argument ' + arg);
-    if (arg === '--prepare-only')
+    if (arg === '--prepare-only' || arg === '--skip-install')
         flags.set(arg, true);
     else if (arg.startsWith('--') && process.argv[i + 1])
         flags.set(arg, process.argv[++i]);
@@ -35,20 +35,49 @@ const registry = 'https://registry.npmjs.org';
 const isDsh = name => /^@deepseek-ai\/dsh(?:-|$)/.test(name);
 const json = (path, value) => writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
 const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex');
-const environment = (extra = {}) => ({ PATH: process.env.PATH, LANG: process.env.LANG ?? 'en_US.UTF-8', HOME: join(report, 'user-home'), TMPDIR: join(report, 'tmp'), npm_config_userconfig: '/dev/null', npm_config_registry: registry, ...extra });
+// A scrubbed environment still needs the shell resolution variables: a Windows
+// child resolves `npm` to `npm.cmd` only through PATHEXT. The shim itself is
+// still not directly spawnable, so Windows runs npm's JS entry through the
+// current interpreter instead of the .cmd wrapper.
+const platform = process.platform === 'win32' ? { COMSPEC: process.env.COMSPEC, PATHEXT: process.env.PATHEXT } : {};
+function npmCommand() {
+    if (process.platform !== 'win32')
+        return ['npm'];
+    for (const dir of (process.env.PATH ?? '').split(';')) {
+        const cli = join(dir, 'node_modules/npm/bin/npm-cli.js');
+        if (existsSync(cli))
+            return [process.execPath, cli];
+    }
+    throw Error('Cannot locate npm-cli.js on PATH for the Windows runtime install');
+}
+// An empty user config keeps a developer's npmrc out of the run. Windows has no
+// /dev/null, and npm treats the resulting unreadable file as a fatal state.
+// AgentTeams peers are optional and intentionally lag the tested host cohort,
+// so the install accepts the same source-tree state that a profile shows.
+const npmConfig = process.platform === 'win32'
+    ? { npm_config_legacy_peer_deps: 'true' }
+    : { npm_config_userconfig: '/dev/null' };
+const environment = (extra = {}) => ({ PATH: process.env.PATH, ...platform, LANG: process.env.LANG ?? 'en_US.UTF-8', HOME: join(report, 'user-home'), TMPDIR: join(report, 'tmp'), ...npmConfig, npm_config_registry: registry, ...extra });
 mkdirSync(join(report, 'user-home'), { recursive: true });
 mkdirSync(join(report, 'tmp'), { recursive: true });
 async function command(argv, cwd, env, label, timeoutMs = 900000) {
-    const child = spawn(argv[0], argv.slice(1), { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', timedOut = false;
-    child.stdout.on('data', x => stdout += x);
-    child.stderr.on('data', x => stderr += x);
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 5000).unref(); }, timeoutMs);
-    const exit = await new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', (code, signal) => resolve({ code, signal })); });
-    clearTimeout(timer);
-    writeFileSync(join(report, label + '.stdout.log'), stdout);
-    writeFileSync(join(report, label + '.stderr.log'), stderr);
-    return { ...exit, timedOut, stdout, stderr };
+    // Child output goes to log files rather than pipes: a confined host can
+    // refuse piped stdio, and the returned text is what the assertions read.
+    const outPath = join(report, label + '.stdout.log'), errPath = join(report, label + '.stderr.log');
+    const outFd = openSync(outPath, 'w'), errFd = openSync(errPath, 'w');
+    let child, timer, timedOut = false;
+    try {
+        child = spawn(argv[0], argv.slice(1), { cwd, env, stdio: ['ignore', outFd, errFd] });
+        timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 5000).unref(); }, timeoutMs);
+        await new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', (code, signal) => resolve({ code, signal })); });
+    }
+    finally {
+        clearTimeout(timer);
+        closeSync(outFd);
+        closeSync(errFd);
+    }
+    const stdout = readFileSync(outPath, 'utf8'), stderr = readFileSync(errPath, 'utf8');
+    return { code: child.exitCode, signal: child.signalCode, timedOut, stdout, stderr };
 }
 async function exactMetadata(name) {
     const response = await fetch(registry + '/' + encodeURIComponent(name) + '/' + version, { signal: AbortSignal.timeout(60000) });
@@ -99,26 +128,70 @@ const manifestPath = join(runtime, 'package.json');
 let manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, 'utf8')) : undefined;
 if (manifest && !['agentteams-harness-runtime-test', 'agentteams-harness-runtime-lab'].includes(manifest.name))
     throw Error('Runtime directory is not owned by this test; choose a fresh --runtime-dir');
+const npm = npmCommand();
 if (manifest?.dependencies?.['@deepseek-ai/dsh'] !== version) {
     if (manifest)
         throw Error('Runtime directory belongs to a different dependency state; use a new directory');
+    if (flags.has('--skip-install'))
+        throw Error('--skip-install needs an already installed runtime directory');
     const cohort = await collectCohort();
     json(join(report, 'registry-cohort.json'), { capturedAt: new Date().toISOString(), registry, version, packages: [...cohort.values()].map(p => ({ name: p.name, version: p.version, gitHead: p.gitHead, dist: p.dist })) });
     manifest = { name: 'agentteams-harness-runtime-test', version: '0.0.0', private: true, type: 'module', dependencies: { '@deepseek-ai/dsh': version }, overrides: Object.fromEntries([...cohort.keys()].map(name => [name, version])) };
 }
-if (flags.has('--artifact')) {
-    const artifact = resolve(flags.get('--artifact'));
-    artifactSha = hash(artifact);
-    const ownArtifact = join(report, 'artifact-' + artifactSha + '.tgz');
-    copyFileSync(artifact, ownArtifact);
-    manifest.dependencies['@nanmicoder/dsh-agent-teams'] = 'file:' + ownArtifact;
+// The artifact is installed from the report copy, so the plugin under test is
+// the packed tarball rather than the working tree. `--plugin-dir` installs a
+// built checkout instead, for verifying uncommitted or unreleased source.
+const ownArtifact = (artifact) => {
+    const path = resolve(artifact);
+    artifactSha = hash(path);
+    const copy = join(report, 'artifact-' + artifactSha + '.tgz');
+    copyFileSync(path, copy);
+    return copy;
+};
+let skippedInstall;
+console.error('[lab] host=' + version + ' runtime=' + runtime);
+if (flags.has('--plugin-dir')) {
+    if (flags.has('--artifact'))
+        throw Error('--plugin-dir and --artifact are mutually exclusive');
+    const dir = resolve(flags.get('--plugin-dir'));
+    const manifestPath = join(dir, 'package.json');
+    if (!existsSync(manifestPath))
+        throw Error('--plugin-dir must point at an AgentTeams checkout: ' + dir);
+    const source = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    if (source.name !== '@nanmicoder/dsh-agent-teams')
+        throw Error('--plugin-dir package identity does not match AgentTeams: ' + source.name);
+    // A checkout that was never built would install a package with no entry
+    // points, so fail before the host does it for us.
+    for (const [subpath, entry] of Object.entries(source.exports ?? {})) {
+        if (typeof entry?.default !== 'string')
+            continue;
+        if (!existsSync(join(dir, entry.default)))
+            throw Error(`--plugin-dir is not built: ${subpath} -> ${entry.default} is missing`);
+    }
+    manifest.dependencies['@nanmicoder/dsh-agent-teams'] = 'file:' + dir;
+    console.error('[lab] plugin-dir=' + dir + ' version=' + source.version);
+}
+else if (flags.has('--artifact')) {
+    const installed = join(runtime, 'node_modules/@nanmicoder/dsh-agent-teams/package.json');
+    if (flags.has('--skip-install')) {
+        if (!existsSync(installed))
+            throw Error('--skip-install requires the artifact to be installed in the runtime directory');
+        const plugin = JSON.parse(readFileSync(installed, 'utf8'));
+        if (plugin.name !== '@nanmicoder/dsh-agent-teams')
+            throw Error('Installed runtime plugin identity does not match AgentTeams');
+        skippedInstall = { version: plugin.version };
+        artifactSha = hash(resolve(flags.get('--artifact')));
+    } else
+        manifest.dependencies['@nanmicoder/dsh-agent-teams'] = 'file:' + ownArtifact(flags.get('--artifact'));
 }
 else if (!flags.has('--prepare-only'))
-    throw Error('--artifact required unless --prepare-only');
+    throw Error('--artifact or --plugin-dir required unless --prepare-only');
 json(manifestPath, manifest);
-const install = await command(['npm', 'install', '--prefer-online', '--no-audit', '--no-fund', '--registry=' + registry, '--userconfig=/dev/null'], runtime, environment({ 'npm_config_cache': process.env.npm_config_cache ?? join(report, 'npm-cache') }), 'install');
-if (install.code !== 0)
-    throw Error('npm installation failed; see ' + join(report, 'install.stderr.log'));
+if (!skippedInstall) {
+    const install = await command([...npm, 'install', '--prefer-online', '--no-audit', '--no-fund', '--registry=' + registry, '--userconfig=/dev/null'], runtime, environment({ 'npm_config_cache': process.env.npm_config_cache ?? join(report, 'npm-cache') }), 'install');
+    if (install.code !== 0)
+        throw Error('npm installation failed; see ' + join(report, 'install.stdout.log') + ' and the npm cache logs');
+}
 const cohort = verifyCohort();
 if (flags.has('--prepare-only')) {
     json(join(report, 'result.json'), { prepared: true, version, runtime, cohortCount: cohort.count });
@@ -133,7 +206,12 @@ for (const scenario of (flags.has('--scenario') ? [flags.get('--scenario')] : sc
     mkdirSync(profile, { recursive: true });
     mkdirSync(workspace, { recursive: true });
     mkdirSync(join(profile, 'node_modules/@nanmicoder'), { recursive: true });
-    symlinkSync(join(runtime, 'node_modules/@nanmicoder/dsh-agent-teams'), join(profile, 'node_modules/@nanmicoder/dsh-agent-teams'), 'dir');
+    const linked = join(profile, 'node_modules/@nanmicoder/dsh-agent-teams');
+    // A 'junction' keeps the profile link working without the Windows symlink
+    // privilege, and a repeated run replaces the previous link.
+    rmSync(linked, { recursive: true, force: true });
+    mkdirSync(dirname(linked), { recursive: true });
+    symlinkSync(join(runtime, 'node_modules/@nanmicoder/dsh-agent-teams'), linked, 'junction');
     json(join(profile, 'package.json'), { name: 'runtime-test-profile', version: '0.0.0', private: true, type: 'module', dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless', '@nanmicoder/dsh-agent-teams'], patchReload: 'startup' } } });
     copyFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/harness-runtime-llm.mjs'), join(profile, 'fixture-llm.mjs'));
     writeFileSync(join(profile, 'cordis.patch.yml'), `- id: llm-deepseek\n  disabled: true\n- id: llm-pi-ai\n  disabled: true\n- id: agent-default-model\n  config:\n    provider: runtime-lab\n    model: fixture-model\n- insert:\n    - id: runtime-lab-fixture\n      name: './fixture-llm.mjs'\n`);

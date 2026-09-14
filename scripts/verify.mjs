@@ -1443,6 +1443,96 @@ check(
     && spawnMemberRecord.id === 'spawned-member',
 )
 
+// The browser surface disables the base subagent delegation rows and lets each
+// preset mount the delegation tools its agent sees, so a delegation tool this
+// plugin names may be absent. `tools.restrict()` treats an unregistered name as
+// a contract error, so naming one there failed the whole child composition and
+// every dispatch rolled back with an empty member id.
+const spawnWithRegistered = async (names, maxDepth) => {
+  let spec
+  const member = {
+    id: '',
+    name: `registered-${names.length}`,
+    role: 'engineer',
+    joinedAt: Date.now(),
+    status: 'idle',
+  }
+  await spawnMember(
+    {
+      tools: { schemas: () => names.map(name => ({ name })) },
+      subagents: {
+        getProvider: () => ({
+          prepareContinuable: () => undefined,
+          capabilities: { persona: true, toolFilter: true },
+        }),
+        list: () => ['spawn'],
+        startContinuable: async candidate => {
+          spec = candidate
+          return { childId: 'registered-member', messageId: 'welcome-message' }
+        },
+      },
+    },
+    { provider: 'spawn', maxDepth },
+    { withPending: async (_parentId, _label, _selection, operation) => operation() },
+    overriddenSelection,
+    captain,
+    spawnTeam,
+    member,
+    '.agent-teams',
+    new AbortController().signal,
+  )
+  return spec?.request?.toolFilter
+}
+
+const absentDelegationDeny = await spawnWithRegistered(['ask_user_question', 'send_message'], 0)
+check(
+  'member spawn drops a delegation tool the composition never registered',
+  absentDelegationDeny?.deny?.includes('subagent') !== true
+    && absentDelegationDeny.deny.includes('send_message'),
+  `deny = ${JSON.stringify(absentDelegationDeny?.deny)}`,
+)
+const presentDelegationDeny = await spawnWithRegistered(['ask_user_question', 'send_message', 'subagent'], 0)
+check(
+  'member spawn still retires a delegation tool that is registered',
+  presentDelegationDeny?.deny?.includes('subagent') === true
+    && presentDelegationDeny.deny.includes('send_message'),
+  `deny = ${JSON.stringify(presentDelegationDeny?.deny)}`,
+)
+const noToolsServiceDeny = await (async () => {
+  let spec
+  const member = { id: '', name: 'no-tools', role: 'engineer', joinedAt: Date.now(), status: 'idle' }
+  await spawnMember(
+    {
+      subagents: {
+        getProvider: () => ({
+          prepareContinuable: () => undefined,
+          capabilities: { persona: true, toolFilter: true },
+        }),
+        list: () => ['spawn'],
+        startContinuable: async candidate => {
+          spec = candidate
+          return { childId: 'no-tools-member', messageId: 'welcome-message' }
+        },
+      },
+    },
+    { provider: 'spawn', maxDepth: 0 },
+    { withPending: async (_parentId, _label, _selection, operation) => operation() },
+    overriddenSelection,
+    captain,
+    spawnTeam,
+    member,
+    '.agent-teams',
+    new AbortController().signal,
+  )
+  return spec?.request?.toolFilter
+})()
+check(
+  'member spawn keeps the requested deny list without a tools service',
+  noToolsServiceDeny?.deny?.includes('subagent') === true
+    && noToolsServiceDeny.deny.includes('send_message'),
+  `deny = ${JSON.stringify(noToolsServiceDeny?.deny)}`,
+)
+
 function descriptorEvent(label, agentProvider = 'descriptor-provider', agentModel = 'descriptor-model') {
   return {
     type: 'subagent/descriptor',

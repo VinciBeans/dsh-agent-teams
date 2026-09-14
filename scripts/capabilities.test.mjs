@@ -248,7 +248,60 @@ test('stable tool presentation uses real scoped registry and prompt assembly', a
         assert.equal(await header(a), initialHeader)
       }
     })
-    await t.test('even aggressive host result pruning cannot remove the system protocol', async () => {
+    await t.test('a composition that registers only some team tools still admits a member', async () => {
+    // The browser surface disables base rows and lets presets mount what each
+    // agent sees, so a captain tool this plugin names may be absent.
+    // `tools.restrict()` rejects an unregistered name, which used to abort the
+    // member session instead of narrowing it.
+    const partialRoot = await mkdtemp(join(tmpdir(), 'agent-teams-capabilities-partial-'))
+    const partialHost = new Context()
+    const partialPrompt = partialHost.plugin(SystemPrompt, { includeHarnessIdentity: false })
+    await partialPrompt.await()
+    const partialTools = partialHost.plugin(ToolRuntime, { mode: 'native' })
+    await partialTools.await()
+    const partialWorker = partialHost.plugin(WorkerThreadCodeRuntime, { computeMs: 3000, maxWallMs: 10000, maxOutputBytes: 1048576, maxOldGenerationSizeMb: 128 })
+    await partialWorker.await()
+    const registered = ['agent_teams_claim_task', 'agent_teams_update_task', 'agent_teams_send_message', 'agent_teams_status']
+    const absent = TEAM_TOOL_NAMES.filter(name => !registered.includes(name))
+    assert.ok(absent.length > 0, 'this regression needs captain tools to be absent')
+    let partialOwned
+    const partialFiber = partialHost.plugin({
+      inject: ['tools', 'systemPrompt'],
+      apply(ctx) {
+        partialOwned = ctx
+        for (const name of registered) ctx.tools.register({ name, description: name, parameters: {}, output: { schema: { type: 'string' }, render: () => [] }, execute: async () => name })
+        ctx.provide('agents', { list: () => [] })
+        installTeamCapabilities(ctx, {
+          stateDir: '.agent-teams',
+          isPendingMember: agent => agent.id === 'partial-member',
+          captainPrompt: () => core,
+        })
+      },
+    })
+    await partialFiber.await()
+    const member = {
+      id: 'partial-member',
+      status: 'idle',
+      session: { header: { cwd: partialRoot, seedLength: 0 }, events: [], append(type, data) { const event = { type, data }; this.events.push(event); return event } },
+    }
+    const memberScope = createScope(partialOwned, member)
+    member.ctx = memberScope.ctx
+    try {
+      partialHost.emit('agent/session-start', { agent: member, source: 'startup' })
+      for (const name of absent) assert.equal(partialHost.tools.get(name, member), undefined, `${name} must be unreachable for the member`)
+      for (const name of registered.filter(name => !MEMBER_TOOL_NAMES.includes(name))) assert.equal(partialHost.tools.get(name, member), undefined, `${name} must be retired for the member`)
+      const visible = (await partialHost.systemPrompt.assemble({ agent: member, scope: member })).tools.map(tool => tool.name).sort()
+      assert.deepEqual(visible, [...MEMBER_TOOL_NAMES].sort(), 'a member keeps exactly its own four operations')
+    } finally {
+      await memberScope.dispose()
+      await partialFiber.dispose()
+      await partialWorker.dispose()
+      await partialTools.dispose()
+      await partialPrompt.dispose()
+      await rm(partialRoot, { recursive: true, force: true })
+    }
+  })
+  await t.test('even aggressive host result pruning cannot remove the system protocol', async () => {
       const pruner = new ToolResultPruner(new Context(), { thresholdChars: 128, headChars: 16, tailChars: 16 })
       const rendered = [{ type: 'text', text: 'x'.repeat(256) + core + 'y'.repeat(256) }]
       const pruned = pruner.pruneContent(rendered)
